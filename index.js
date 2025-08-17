@@ -10,11 +10,11 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || 'APP_USR-501318068005689-072914-b7509894d85fca161053dc8bfbb90cab-2540238003';
+const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN;
 
 // Configuração da chave PIX
-const PIX_KEY = process.env.PIX_KEY || 'ftwsolucoesautomotivas6@gmail.com';
-const PIX_KEY_TYPE = process.env.PIX_KEY_TYPE || 'email'; // email, cpf, cnpj, phone, random
+const PIX_KEY = process.env.PIX_KEY;
+const PIX_KEY_TYPE = process.env.PIX_KEY_TYPE; 
 
 // Função para detectar o tipo de cartão baseado no BIN
 function detectCardType(cardNumber) {
