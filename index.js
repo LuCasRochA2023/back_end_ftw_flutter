@@ -1,3 +1,8 @@
+import fs from 'fs';
+import https from 'https';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { execFileSync } from 'child_process';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -10,11 +15,26 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
+const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN;
+const DEFAULT_STATEMENT_DESCRIPTOR = (process.env.STATEMENT_DESCRIPTOR || process.env.MERCADO_PAGO_STATEMENT_DESCRIPTOR || '').trim();
 // Configuração da chave PIX
 const PIX_KEY = process.env.PIX_KEY;
 const PIX_KEY_TYPE = process.env.PIX_KEY_TYPE; 
+
+const SSL_ENABLED = (process.env.SSL_ENABLED ?? 'true').toLowerCase() !== 'false';
+const SSL_AUTO_GENERATE = (process.env.SSL_AUTO_GENERATE ?? 'true').toLowerCase() !== 'false';
+const SSL_CERT_PATH = process.env.SSL_CERT_PATH || path.join(__dirname, 'certs', 'selfsigned.cert.pem');
+const SSL_KEY_PATH = process.env.SSL_KEY_PATH || path.join(__dirname, 'certs', 'selfsigned.key.pem');
+const SSL_COMMON_NAME = process.env.SSL_COMMON_NAME || 'localhost';
+const SSL_VALIDITY_DAYS = Number.isNaN(parseInt(process.env.SSL_VALIDITY_DAYS || '', 10))
+  ? 365
+  : parseInt(process.env.SSL_VALIDITY_DAYS, 10);
+const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '3443', 10);
+const HOST = process.env.HOST || '0.0.0.0';
+const SSL_SAN = process.env.SSL_SAN || `DNS:${SSL_COMMON_NAME},DNS:localhost,IP:127.0.0.1`;
 
 // Função para detectar o tipo de cartão baseado no BIN
 function detectCardType(cardNumber) {
@@ -48,6 +68,69 @@ function detectCardType(cardNumber) {
   
   // Default to master for unknown cards
   return 'master';
+}
+
+function loadSslCredentials() {
+  const keyExists = fs.existsSync(SSL_KEY_PATH);
+  const certExists = fs.existsSync(SSL_CERT_PATH);
+
+  if (keyExists && certExists) {
+    return {
+      key: fs.readFileSync(SSL_KEY_PATH, 'utf8'),
+      cert: fs.readFileSync(SSL_CERT_PATH, 'utf8'),
+      source: 'existing-files',
+    };
+  }
+
+  if (!SSL_AUTO_GENERATE) {
+    throw new Error('Certificados SSL não encontrados e geração automática desabilitada.');
+  }
+
+  if (keyExists || certExists) {
+    console.warn('Certificados SSL incompletos encontrados. Gerando novo par autoassinado.');
+  }
+
+  const certDir = path.dirname(SSL_CERT_PATH);
+  const keyDir = path.dirname(SSL_KEY_PATH);
+  fs.mkdirSync(certDir, { recursive: true });
+  fs.mkdirSync(keyDir, { recursive: true });
+
+  const subject = process.env.SSL_SUBJECT || `/CN=${SSL_COMMON_NAME}`;
+  const baseArgs = [
+    'req',
+    '-x509',
+    '-newkey',
+    'rsa:2048',
+    '-sha256',
+    '-nodes',
+    '-keyout',
+    SSL_KEY_PATH,
+    '-out',
+    SSL_CERT_PATH,
+    '-subj',
+    subject,
+    '-days',
+    String(SSL_VALIDITY_DAYS),
+  ];
+
+  try {
+    execFileSync('openssl', [...baseArgs, '-addext', `subjectAltName=${SSL_SAN}`], { stdio: 'ignore' });
+  } catch (error) {
+    console.warn('Falha ao incluir subjectAltName via OpenSSL. Tentando gerar certificado sem SAN explícito.');
+    try {
+      execFileSync('openssl', baseArgs, { stdio: 'ignore' });
+    } catch (secondaryError) {
+      throw new Error(`Falha ao gerar certificado SSL com OpenSSL: ${secondaryError.message}`);
+    }
+  }
+
+  console.log(`Certificado SSL autoassinado gerado com OpenSSL em ${SSL_CERT_PATH}`);
+
+  return {
+    key: fs.readFileSync(SSL_KEY_PATH, 'utf8'),
+    cert: fs.readFileSync(SSL_CERT_PATH, 'utf8'),
+    source: 'generated',
+  };
 }
 
 // Rota para testar configuração do Mercado Pago
@@ -93,6 +176,7 @@ app.post('/create-payment', async (req, res) => {
     cardToken, // opcional
     paymentMethod, // 'pix' ou 'credit_card'
     cardNumber, // necessário para detectar o tipo de cartão
+    statementDescriptor,
   } = req.body;
 
   console.log('=== DEBUG: Recebendo requisição de pagamento ===');
@@ -122,6 +206,12 @@ app.post('/create-payment', async (req, res) => {
       user_id: payer.userId || 'unknown',
     },
   };
+
+  const normalizedDescriptor = (statementDescriptor || DEFAULT_STATEMENT_DESCRIPTOR || '').trim().slice(0, 16);
+  if (normalizedDescriptor) {
+    paymentData.statement_descriptor = normalizedDescriptor;
+    console.log(`Statement descriptor aplicado: ${normalizedDescriptor}`);
+  }
 
   if (paymentMethod === 'credit_card') {
     if (!cardToken) {
@@ -310,11 +400,36 @@ app.get('/pix-info', (req, res) => {
   });
 });
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+const PORT = parseInt(process.env.PORT || '3001', 10);
+
+app.listen(PORT, HOST, () => {
   console.log('=== DEBUG: Configuração do Backend ===');
   console.log('Access Token:', MP_ACCESS_TOKEN ? 'Configurado' : 'Não configurado');
   console.log('PIX Key:', PIX_KEY);
   console.log('PIX Key Type:', PIX_KEY_TYPE);
-  console.log(`Backend de pagamento rodando na porta ${PORT}`);
+  console.log(`Backend de pagamento rodando na porta HTTP ${PORT}`);
 });
+
+if (SSL_ENABLED) {
+  try {
+    const { key, cert, source } = loadSslCredentials();
+    const httpsOptions = {
+      key,
+      cert,
+    };
+
+    if (process.env.SSL_PASSPHRASE) {
+      httpsOptions.passphrase = process.env.SSL_PASSPHRASE;
+    }
+
+    https.createServer(httpsOptions, app).listen(HTTPS_PORT, HOST, () => {
+      console.log('=== DEBUG: HTTPS habilitado ===');
+      console.log(`Certificado SSL carregado de: ${source === 'generated' ? 'auto-gerado' : 'arquivo existente'}`);
+      console.log(`Backend de pagamento rodando na porta HTTPS ${HTTPS_PORT}`);
+    });
+  } catch (error) {
+    console.warn(`⚠️ HTTPS não iniciado: ${error.message}`);
+  }
+} else {
+  console.log('HTTPS desabilitado. Defina SSL_ENABLED=true para ativar.');
+}
