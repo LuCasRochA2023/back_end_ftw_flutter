@@ -3,6 +3,7 @@ import https from 'https';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
+import { constants as cryptoConstants } from 'crypto';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -416,6 +417,8 @@ if (SSL_ENABLED) {
     const httpsOptions = {
       key,
       cert,
+      minVersion: 'TLSv1.2',
+      secureOptions: cryptoConstants.SSL_OP_NO_TLSv1 | cryptoConstants.SSL_OP_NO_TLSv1_1,
     };
 
     if (process.env.SSL_PASSPHRASE) {
@@ -425,6 +428,7 @@ if (SSL_ENABLED) {
     https.createServer(httpsOptions, app).listen(HTTPS_PORT, HOST, () => {
       console.log('=== DEBUG: HTTPS habilitado ===');
       console.log(`Certificado SSL carregado de: ${source === 'generated' ? 'auto-gerado' : 'arquivo existente'}`);
+      console.log('Versão mínima TLS aplicadas: TLSv1.2');
       console.log(`Backend de pagamento rodando na porta HTTPS ${HTTPS_PORT}`);
     });
   } catch (error) {
