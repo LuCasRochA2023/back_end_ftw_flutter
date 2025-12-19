@@ -21,6 +21,7 @@ const __dirname = path.dirname(__filename);
 
 const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN;
 const DEFAULT_STATEMENT_DESCRIPTOR = (process.env.STATEMENT_DESCRIPTOR || process.env.MERCADO_PAGO_STATEMENT_DESCRIPTOR || '').trim();
+const MP_NOTIFICATION_URL = (process.env.MP_NOTIFICATION_URL || process.env.NOTIFICATION_URL || '').trim();
 // Configuração da chave PIX
 const PIX_KEY = process.env.PIX_KEY;
 const PIX_KEY_TYPE = process.env.PIX_KEY_TYPE; 
@@ -177,6 +178,9 @@ app.post('/create-payment', async (req, res) => {
     cardToken, // opcional
     paymentMethod, // 'pix' ou 'credit_card'
     cardNumber, // necessário para detectar o tipo de cartão
+    items, // opcional: [{ title, description, category_id|categoryId, quantity, unit_price }]
+    categoryId, // opcional: categoria padrão quando items não vier
+    notificationUrl, // opcional: sobrescreve notification_url por request
     statementDescriptor,
   } = req.body;
 
@@ -207,6 +211,64 @@ app.post('/create-payment', async (req, res) => {
       user_id: payer.userId || 'unknown',
     },
   };
+
+  // Enviar itens (com category_id) para melhorar análise de risco / aprovação no Mercado Pago.
+  // Referência: Campo additional_info.items (Payments API).
+  const DEFAULT_ITEM_CATEGORY_ID = (process.env.MP_DEFAULT_ITEM_CATEGORY_ID || '').trim();
+  const fallbackCategoryId = (categoryId || DEFAULT_ITEM_CATEGORY_ID || '').trim();
+  const normalizedAmount = parseFloat(amount);
+
+  const normalizeItems = () => {
+    // Se vier uma lista de items no request, normaliza e usa.
+    if (Array.isArray(items) && items.length > 0) {
+      const normalized = items
+        .map((it) => {
+          const quantity = Number.isFinite(Number(it.quantity)) && Number(it.quantity) > 0 ? Number(it.quantity) : 1;
+          const unitPrice = Number.isFinite(Number(it.unit_price)) && Number(it.unit_price) > 0
+            ? Number(it.unit_price)
+            : (Number.isFinite(normalizedAmount) ? normalizedAmount : 0);
+          const category = (it.category_id || it.categoryId || fallbackCategoryId || '').toString().trim();
+
+          return {
+            id: it.id ? String(it.id) : undefined,
+            title: it.title ? String(it.title) : String(description),
+            description: it.description ? String(it.description) : String(description),
+            category_id: category || undefined,
+            quantity,
+            unit_price: unitPrice,
+          };
+        })
+        .filter((it) => Number(it.unit_price) > 0 && Number(it.quantity) > 0);
+
+      if (normalized.length > 0) return normalized;
+    }
+
+    // Caso contrário, cria um item padrão usando description/amount.
+    return [
+      {
+        title: String(description),
+        description: String(description),
+        category_id: fallbackCategoryId || undefined,
+        quantity: 1,
+        unit_price: Number.isFinite(normalizedAmount) ? normalizedAmount : 0,
+      },
+    ].filter((it) => Number(it.unit_price) > 0);
+  };
+
+  const additionalItems = normalizeItems();
+  if (additionalItems.length > 0) {
+    paymentData.additional_info = {
+      items: additionalItems,
+    };
+    console.log('Itens enviados para análise de risco (additional_info.items):', JSON.stringify(additionalItems, null, 2));
+  }
+
+  // Webhook do Mercado Pago (Payments API)
+  const resolvedNotificationUrl = (notificationUrl || MP_NOTIFICATION_URL || '').toString().trim();
+  if (resolvedNotificationUrl) {
+    paymentData.notification_url = resolvedNotificationUrl;
+    console.log(`notification_url aplicado: ${resolvedNotificationUrl}`);
+  }
 
   const normalizedDescriptor = (statementDescriptor || DEFAULT_STATEMENT_DESCRIPTOR || '').trim().slice(0, 16);
   if (normalizedDescriptor) {
@@ -320,6 +382,24 @@ app.post('/create-payment', async (req, res) => {
     }
     
     res.status(500).json({ error: error.response?.data || error.message });
+  }
+});
+
+// Endpoint para receber notificações (Webhook) do Mercado Pago.
+// Configure MP_NOTIFICATION_URL (ou NOTIFICATION_URL) apontando para esta rota pública.
+app.post('/webhooks/mercadopago', (req, res) => {
+  try {
+    // Mercado Pago pode enviar diferentes formatos dependendo do produto/config.
+    // Registramos o payload completo para debug/auditoria.
+    console.log('=== WEBHOOK Mercado Pago recebido ===');
+    console.log('Headers:', JSON.stringify(req.headers, null, 2));
+    console.log('Body:', JSON.stringify(req.body, null, 2));
+
+    // Responder 200 rápido para evitar retries.
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('Erro ao processar webhook Mercado Pago:', error.message);
+    res.sendStatus(500);
   }
 });
 
