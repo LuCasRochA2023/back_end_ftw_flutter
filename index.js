@@ -181,6 +181,7 @@ app.post('/create-payment', async (req, res) => {
     items, // opcional: [{ title, description, category_id|categoryId, quantity, unit_price }]
     categoryId, // opcional: categoria padrão quando items não vier
     notificationUrl, // opcional: sobrescreve notification_url por request
+    deviceId, // opcional: Device Session ID do Mercado Pago (MP_DEVICE_SESSION_ID)
     statementDescriptor,
   } = req.body;
 
@@ -312,6 +313,10 @@ app.post('/create-payment', async (req, res) => {
   }
 
   try {
+    const resolvedDeviceId = (deviceId || req.headers['x-meli-session-id'] || req.headers['x-meli-sessionid'] || '')
+      .toString()
+      .trim();
+
     console.log('=== DEBUG: Enviando dados para Mercado Pago ===');
     console.log('Token do cartão:', cardToken);
     console.log('Número do cartão:', cardNumber);
@@ -326,6 +331,7 @@ app.post('/create-payment', async (req, res) => {
           Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
           'Content-Type': 'application/json',
           'X-Idempotency-Key': idempotencyKey,
+          ...(resolvedDeviceId ? { 'X-meli-session-id': resolvedDeviceId } : {}),
         },
       }
     );
@@ -479,6 +485,94 @@ app.get('/pix-info', (req, res) => {
     pixKeyType: PIX_KEY_TYPE,
     status: 'configured'
   });
+});
+
+// Checkout Pro: criar preferência (Preferences API)
+// Envie notification_url no request de "Preferências" para habilitar Webhooks.
+app.post('/create-preference', async (req, res) => {
+  const {
+    items,
+    payer,
+    notificationUrl, // opcional: sobrescreve notification_url por request
+    externalReference,
+    backUrls,
+    autoReturn,
+    statementDescriptor,
+    deviceId, // opcional: Device Session ID do Mercado Pago (MP_DEVICE_SESSION_ID)
+  } = req.body || {};
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'items é obrigatório para criar preferência.' });
+  }
+
+  const normalizedItems = items.map((it) => ({
+    id: it.id ? String(it.id) : undefined,
+    title: it.title ? String(it.title) : undefined,
+    description: it.description ? String(it.description) : undefined,
+    category_id: (it.category_id || it.categoryId || '').toString().trim() || undefined,
+    quantity: Number.isFinite(Number(it.quantity)) && Number(it.quantity) > 0 ? Number(it.quantity) : 1,
+    unit_price: Number.isFinite(Number(it.unit_price)) ? Number(it.unit_price) : undefined,
+    currency_id: it.currency_id ? String(it.currency_id) : undefined,
+  }));
+
+  const resolvedNotificationUrl = (notificationUrl || MP_NOTIFICATION_URL || '').toString().trim();
+  const normalizedDescriptor = (statementDescriptor || DEFAULT_STATEMENT_DESCRIPTOR || '').trim().slice(0, 16);
+  const resolvedExternalReference = (externalReference || '').toString().trim() || uuidv4();
+  const resolvedDeviceId = (deviceId || req.headers['x-meli-session-id'] || req.headers['x-meli-sessionid'] || '')
+    .toString()
+    .trim();
+
+  const preferenceData = {
+    items: normalizedItems,
+  };
+
+  if (payer?.email) {
+    preferenceData.payer = {
+      email: payer.email,
+      name: payer.firstName || payer.name || '',
+      surname: payer.lastName || payer.surname || '',
+    };
+  }
+
+  if (resolvedNotificationUrl) {
+    preferenceData.notification_url = resolvedNotificationUrl;
+  }
+
+  // external_reference: código único para correlacionar payment_id com ID interno do seu sistema
+  preferenceData.external_reference = resolvedExternalReference;
+
+  if (backUrls && typeof backUrls === 'object') {
+    preferenceData.back_urls = backUrls;
+  }
+
+  if (autoReturn) {
+    preferenceData.auto_return = String(autoReturn);
+  }
+
+  if (normalizedDescriptor) {
+    // Campo usado no Checkout Pro para fatura/cartão, quando aplicável
+    preferenceData.statement_descriptor = normalizedDescriptor;
+  }
+
+  try {
+    const response = await axios.post(
+      'https://api.mercadopago.com/checkout/preferences',
+      preferenceData,
+      {
+        headers: {
+          Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json',
+          ...(resolvedDeviceId ? { 'X-meli-session-id': resolvedDeviceId } : {}),
+        },
+      }
+    );
+
+    // Inclui o external_reference usado (em geral o MP também devolve esse campo)
+    res.status(200).json({ ...response.data, external_reference: resolvedExternalReference });
+  } catch (error) {
+    console.error('Erro ao criar preferência:', error.response?.data || error.message);
+    res.status(500).json({ error: error.response?.data || error.message });
+  }
 });
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
