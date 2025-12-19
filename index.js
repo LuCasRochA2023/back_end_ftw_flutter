@@ -182,6 +182,7 @@ app.post('/create-payment', async (req, res) => {
     categoryId, // opcional: categoria padrão quando items não vier
     notificationUrl, // opcional: sobrescreve notification_url por request
     deviceId, // opcional: Device Session ID do Mercado Pago (MP_DEVICE_SESSION_ID)
+    externalReference, // opcional: ID interno para correlacionar payment_id no MP
     statementDescriptor,
   } = req.body;
 
@@ -212,6 +213,10 @@ app.post('/create-payment', async (req, res) => {
       user_id: payer.userId || 'unknown',
     },
   };
+
+  // external_reference: código único para correlacionar payment_id com ID interno do seu sistema
+  const resolvedExternalReference = (externalReference || '').toString().trim() || uuidv4();
+  paymentData.external_reference = resolvedExternalReference;
 
   // Enviar itens (com category_id) para melhorar análise de risco / aprovação no Mercado Pago.
   // Referência: Campo additional_info.items (Payments API).
@@ -365,7 +370,8 @@ app.post('/create-payment', async (req, res) => {
       console.log('❌ Pagamento rejeitado');
     }
     
-    res.status(200).json(response.data);
+    // Inclui o external_reference usado para facilitar correlação no cliente
+    res.status(200).json({ ...response.data, external_reference: resolvedExternalReference });
   } catch (error) {
     console.error('Erro ao criar pagamento:', error.response?.data || error.message);
     
