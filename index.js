@@ -24,7 +24,6 @@ const __dirname = path.dirname(__filename);
 const MP_ACCESS_TOKEN =
   process.env.MERCADO_PAGO_ACCESS_TOKEN ||
   process.env.MERCADOPAGO_ACCESS_TOKEN ||
-  process.env.MERCADOPAGO_ACCESS_TOKEN ||
   '';
 const MP_PUBLIC_KEY =
   process.env.MERCADO_PAGO_PUBLIC_KEY || process.env.MERCADOPAGO_PUBLIC_KEY || '';
@@ -258,7 +257,12 @@ app.post('/create-payment', async (req, res) => {
     payer,
     cardToken,
     paymentMethod, // 'pix' | 'credit_card'
-    cardNumber, // apenas para detectar tipo (NÃO enviar ao MP)
+    // Não exija PAN: o app deve mandar token + paymentMethodId (bandeira) e opcionalmente BIN/last4
+    cardNumber, // (compat legado) usado só para detectar bandeira localmente
+    paymentMethodId, // ex: "master"
+    installments,
+    cardBin,
+    cardLast4,
     items,
     categoryId,
     notificationUrl,
@@ -287,7 +291,9 @@ app.post('/create-payment', async (req, res) => {
     });
   }
 
-  const idempotencyKey = req.get('x-idempotency-key') || uuidv4();
+  // Express faz lookup case-insensitive, mas aceitamos também header alternativo "Idempotency-Key"
+  const idempotencyKey =
+    req.get('x-idempotency-key') || req.get('idempotency-key') || uuidv4();
   const clientIp = getClientIp(req);
   const clientUserAgent = req.get('user-agent') || '';
   const resolvedDeviceId = getMeliSessionId(req, deviceId);
@@ -296,7 +302,6 @@ app.post('/create-payment', async (req, res) => {
     transaction_amount: cleanAmount,
     description: cleanDesc,
     external_reference: String(externalReference || '').trim() || uuidv4(),
-    binary_mode: true,
     payer: {
       email: payer.email,
       first_name: first || undefined,
@@ -358,6 +363,8 @@ app.post('/create-payment', async (req, res) => {
   const additionalItems = normalizeItems();
   paymentData.additional_info = {
     items: additionalItems,
+    // Ajuda na análise de risco (quando disponível)
+    ip_address: clientIp || undefined,
     payer: {
       ...(address.zip_code || address.street_name ? { address } : {}),
       ...(payer?.dateRegistered || payer?.registrationDate
@@ -385,12 +392,19 @@ app.post('/create-payment', async (req, res) => {
       return res.status(400).json({ error: 'Token do cartão é obrigatório para pagamento com cartão.' });
     }
 
-    const cardType = detectCardType(cardNumber);
+    const pmId = String(paymentMethodId || '').trim();
+    const cardType = pmId || detectCardType(cardNumber);
     paymentData.payment_method_id = cardType;
     paymentData.token = cardToken;
-    paymentData.installments = 1;
+    paymentData.installments =
+      Number.isFinite(Number(installments)) && Number(installments) > 0 ? Number(installments) : 1;
     paymentData.capture = true;
+    paymentData.binary_mode = true;
     paymentData.three_d_secure_mode = 'optional';
+
+    // Opcional: metadata sem dados sensíveis (BIN/last4) para auditoria interna
+    if (cardBin) paymentData.metadata.card_bin = String(cardBin);
+    if (cardLast4) paymentData.metadata.card_last4 = String(cardLast4);
   } else {
     paymentData.payment_method_id = 'pix';
   }
