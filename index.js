@@ -173,10 +173,34 @@ function getMeliSessionId(req, bodyDeviceId) {
 }
 
 function getClientIp(req) {
-  // trust proxy = true → req.ip já considera x-forwarded-for
-  const ip = req.ip || '';
-  return String(ip).trim();
+  // Em hospedagens com reverse proxy (Hostinger/nginx/Cloudflare),
+  // se X-Forwarded-For não vier, req.ip tende a virar 127.0.0.1 (ruim p/ antifraude).
+  const pickFirst = (v) => String(v || '').split(',')[0].trim();
+
+  const cfConnectingIp = pickFirst(req.get('cf-connecting-ip'));
+  if (cfConnectingIp) return cfConnectingIp;
+
+  const xRealIp = pickFirst(req.get('x-real-ip'));
+  if (xRealIp) return xRealIp;
+
+  const xForwardedFor = pickFirst(req.get('x-forwarded-for'));
+  if (xForwardedFor) return xForwardedFor;
+
+  const ip = String(req.ip || req.connection?.remoteAddress || '').trim();
+  return ip.replace(/^::ffff:/, '');
 }
+
+// Endpoint de diagnóstico: confirma qual IP o servidor está enxergando e quais headers chegaram.
+app.get('/debug/ip', (req, res) => {
+  res.json({
+    ip: getClientIp(req),
+    req_ip: req.ip,
+    x_forwarded_for: req.get('x-forwarded-for') || null,
+    x_real_ip: req.get('x-real-ip') || null,
+    cf_connecting_ip: req.get('cf-connecting-ip') || null,
+    user_agent: req.get('user-agent') || null,
+  });
+});
 
 function normalizeCpf(payer) {
   const cpfFromLegacy = payer?.cpf;
