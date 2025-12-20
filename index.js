@@ -440,7 +440,19 @@ app.post('/create-payment', async (req, res) => {
       timeout: 30000,
     });
 
-    res.status(200).json({
+    // Importante: o MP pode responder 200 mesmo com status="rejected".
+    // Então ajustamos o HTTP status para o app tratar corretamente.
+    const mpPayment = response.data;
+    const httpStatus =
+      mpPayment?.status === 'approved'
+        ? 200
+        : mpPayment?.status === 'in_process'
+          ? 202
+          : mpPayment?.status === 'rejected'
+            ? 402
+            : 200;
+
+    res.status(httpStatus).json({
       ...response.data,
       external_reference: paymentData.external_reference,
     });
