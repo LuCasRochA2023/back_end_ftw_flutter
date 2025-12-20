@@ -219,6 +219,19 @@ function normalizeAddress(payer) {
   };
 }
 
+function toAdditionalInfoAddress(address) {
+  // Mercado Pago é bem restritivo no additional_info.payer.address.
+  // NÃO enviar city/neighborhood/federal_unit aqui (gera erro "name of parameters is wrong").
+  const a = address || {};
+  const minimal = {
+    zip_code: a.zip_code || undefined,
+    street_name: a.street_name || undefined,
+    street_number: a.street_number || undefined,
+  };
+  if (!minimal.zip_code && !minimal.street_name && !minimal.street_number) return null;
+  return minimal;
+}
+
 // Rota para testar configuração do Mercado Pago
 app.get('/config-test', async (req, res) => {
   try {
@@ -361,12 +374,13 @@ app.post('/create-payment', async (req, res) => {
   };
 
   const additionalItems = normalizeItems();
+  const additionalAddress = toAdditionalInfoAddress(address);
   paymentData.additional_info = {
     items: additionalItems,
     // Ajuda na análise de risco (quando disponível)
     ip_address: clientIp || undefined,
     payer: {
-      ...(address.zip_code || address.street_name ? { address } : {}),
+      ...(additionalAddress ? { address: additionalAddress } : {}),
       ...(payer?.dateRegistered || payer?.registrationDate
         ? { registration_date: payer.dateRegistered || payer.registrationDate }
         : {}),
