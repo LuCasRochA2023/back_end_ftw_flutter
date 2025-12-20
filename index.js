@@ -413,7 +413,9 @@ app.post('/create-payment', async (req, res) => {
     paymentData.installments =
       Number.isFinite(Number(installments)) && Number(installments) > 0 ? Number(installments) : 1;
     paymentData.capture = true;
-    paymentData.binary_mode = true;
+    // binary_mode=true força "approved" ou "rejected" (menos "in_process").
+    // Para reduzir recusas por risco e permitir análise, use MP_BINARY_MODE=false.
+    paymentData.binary_mode = (process.env.MP_BINARY_MODE ?? 'false').toLowerCase() === 'true';
     paymentData.three_d_secure_mode = 'optional';
 
     // Opcional: metadata sem dados sensíveis (BIN/last4) para auditoria interna
@@ -443,7 +445,25 @@ app.post('/create-payment', async (req, res) => {
       external_reference: paymentData.external_reference,
     });
   } catch (error) {
-    res.status(500).json({ error: error.response?.data || error.message });
+    const status = error.response?.status || 500;
+    const mp = error.response?.data;
+
+    // Log rico no servidor ajuda a descobrir exatamente o motivo (status_detail/cause).
+    console.error('Erro Mercado Pago /v1/payments:', {
+      status,
+      mp,
+      message: error.message,
+    });
+
+    res.status(status).json({
+      error: mp || error.message,
+      mp_status: mp?.status,
+      mp_status_detail: mp?.status_detail,
+      mp_id: mp?.id,
+      mp_message: mp?.message,
+      mp_error: mp?.error,
+      mp_cause: mp?.cause,
+    });
   }
 });
 
