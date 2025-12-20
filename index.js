@@ -13,62 +13,85 @@ import { v4 as uuidv4 } from 'uuid';
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+app.set('trust proxy', true); // importante p/ req.ip atrás de nginx/cloudflare
+app.use(express.json({ limit: '1mb' }));
 app.use(cors());
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN;
-const DEFAULT_STATEMENT_DESCRIPTOR = (process.env.STATEMENT_DESCRIPTOR || process.env.MERCADO_PAGO_STATEMENT_DESCRIPTOR || '').trim();
-const MP_NOTIFICATION_URL = (process.env.MP_NOTIFICATION_URL || process.env.NOTIFICATION_URL || '').trim();
-// Configuração da chave PIX
+// Aceita ambas as chaves (você usou nomes diferentes em lugares diferentes)
+const MP_ACCESS_TOKEN =
+  process.env.MERCADO_PAGO_ACCESS_TOKEN ||
+  process.env.MERCADOPAGO_ACCESS_TOKEN ||
+  process.env.MERCADOPAGO_ACCESS_TOKEN ||
+  '';
+const MP_PUBLIC_KEY =
+  process.env.MERCADO_PAGO_PUBLIC_KEY || process.env.MERCADOPAGO_PUBLIC_KEY || '';
+
+const DEFAULT_STATEMENT_DESCRIPTOR = (
+  process.env.STATEMENT_DESCRIPTOR ||
+  process.env.MERCADO_PAGO_STATEMENT_DESCRIPTOR ||
+  process.env.MERCADOPAGO_STATEMENT_DESCRIPTOR ||
+  ''
+).trim();
+
+const MP_NOTIFICATION_URL = (
+  process.env.MP_NOTIFICATION_URL ||
+  process.env.NOTIFICATION_URL ||
+  ''
+).trim();
+
+// Configuração da chave PIX (se você usa pixKey no MP, isso aqui não é usado pelo /v1/payments)
 const PIX_KEY = process.env.PIX_KEY;
-const PIX_KEY_TYPE = process.env.PIX_KEY_TYPE; 
+const PIX_KEY_TYPE = process.env.PIX_KEY_TYPE;
 
 const SSL_ENABLED = (process.env.SSL_ENABLED ?? 'true').toLowerCase() !== 'false';
-const SSL_AUTO_GENERATE = (process.env.SSL_AUTO_GENERATE ?? 'true').toLowerCase() !== 'false';
-const SSL_CERT_PATH = process.env.SSL_CERT_PATH || path.join(__dirname, 'certs', 'selfsigned.cert.pem');
-const SSL_KEY_PATH = process.env.SSL_KEY_PATH || path.join(__dirname, 'certs', 'selfsigned.key.pem');
+const SSL_AUTO_GENERATE =
+  (process.env.SSL_AUTO_GENERATE ?? 'true').toLowerCase() !== 'false';
+const SSL_CERT_PATH =
+  process.env.SSL_CERT_PATH ||
+  path.join(__dirname, 'certs', 'selfsigned.cert.pem');
+const SSL_KEY_PATH =
+  process.env.SSL_KEY_PATH || path.join(__dirname, 'certs', 'selfsigned.key.pem');
 const SSL_COMMON_NAME = process.env.SSL_COMMON_NAME || 'localhost';
 const SSL_VALIDITY_DAYS = Number.isNaN(parseInt(process.env.SSL_VALIDITY_DAYS || '', 10))
   ? 365
   : parseInt(process.env.SSL_VALIDITY_DAYS, 10);
 const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '3443', 10);
 const HOST = process.env.HOST || '0.0.0.0';
-const SSL_SAN = process.env.SSL_SAN || `DNS:${SSL_COMMON_NAME},DNS:localhost,IP:127.0.0.1`;
+const SSL_SAN =
+  process.env.SSL_SAN || `DNS:${SSL_COMMON_NAME},DNS:localhost,IP:127.0.0.1`;
 
-// Função para detectar o tipo de cartão baseado no BIN
 function detectCardType(cardNumber) {
-  const cleanNumber = cardNumber.replace(/\D/g, '');
-  const firstTwo = parseInt(cleanNumber.substring(0, 2));
-  const firstFour = parseInt(cleanNumber.substring(0, 4));
-  const firstSix = parseInt(cleanNumber.substring(0, 6));
+  const clean = String(cardNumber || '').replace(/\D/g, '');
+  if (clean.length < 6) return 'master';
+
+  const firstTwo = parseInt(clean.substring(0, 2), 10);
+  const firstFour = parseInt(clean.substring(0, 4), 10);
+  const firstSix = parseInt(clean.substring(0, 6), 10);
 
   // Visa
-  if (cleanNumber.startsWith('4')) return 'visa';
-  
+  if (clean.startsWith('4')) return 'visa';
+
   // Mastercard
   if (firstTwo >= 51 && firstTwo <= 55) return 'master';
   if (firstFour >= 2221 && firstFour <= 2720) return 'master';
-  
-  // American Express
+
+  // Amex
   if (firstTwo === 34 || firstTwo === 37) return 'amex';
-  
-  // Elo
-  if (firstFour === 636368 || firstFour === 438935 || firstFour === 504175 || 
-      firstFour === 451416 || firstFour === 636297 || firstFour === 509048 ||
-      firstFour === 509067 || firstFour === 509049 || firstFour === 509069 ||
-      firstFour === 509050 || firstFour === 509074 || firstFour === 509068 ||
-      firstFour === 509040 || firstFour === 509045 || firstFour === 509051 ||
-      firstFour === 509046 || firstFour === 509066 || firstFour === 509047 ||
-      firstFour === 509042 || firstFour === 509052 || firstFour === 509043 ||
-      firstFour === 509064 || firstFour === 509040) return 'elo';
-  
+
+  // Elo (BINs 6 dígitos) — antes estava comparando com firstFour (bug)
+  const eloBins = new Set([
+    636368, 438935, 504175, 451416, 636297, 509048, 509067, 509049, 509069,
+    509050, 509074, 509068, 509040, 509045, 509051, 509046, 509066, 509047,
+    509042, 509052, 509043, 509064,
+  ]);
+  if (eloBins.has(firstSix)) return 'elo';
+
   // Hipercard
   if (firstSix === 606282) return 'hipercard';
-  
-  // Default to master for unknown cards
+
   return 'master';
 }
 
@@ -116,14 +139,14 @@ function loadSslCredentials() {
   ];
 
   try {
-    execFileSync('openssl', [...baseArgs, '-addext', `subjectAltName=${SSL_SAN}`], { stdio: 'ignore' });
+    execFileSync('openssl', [...baseArgs, '-addext', `subjectAltName=${SSL_SAN}`], {
+      stdio: 'ignore',
+    });
   } catch (error) {
-    console.warn('Falha ao incluir subjectAltName via OpenSSL. Tentando gerar certificado sem SAN explícito.');
-    try {
-      execFileSync('openssl', baseArgs, { stdio: 'ignore' });
-    } catch (secondaryError) {
-      throw new Error(`Falha ao gerar certificado SSL com OpenSSL: ${secondaryError.message}`);
-    }
+    console.warn(
+      'Falha ao incluir subjectAltName via OpenSSL. Tentando gerar certificado sem SAN explícito.'
+    );
+    execFileSync('openssl', baseArgs, { stdio: 'ignore' });
   }
 
   console.log(`Certificado SSL autoassinado gerado com OpenSSL em ${SSL_CERT_PATH}`);
@@ -135,36 +158,94 @@ function loadSslCredentials() {
   };
 }
 
+function getMeliSessionId(req, bodyDeviceId) {
+  const h =
+    req.get('x-meli-session-id') ||
+    req.get('x-meli-sessionid') ||
+    req.get('X-meli-session-id') ||
+    req.get('X-meli-sessionid');
+  const b =
+    bodyDeviceId ||
+    req.body?.device_id ||
+    req.body?.deviceId ||
+    req.body?.device_session_id ||
+    req.body?.deviceSessionId;
+  return String(h || b || '').trim();
+}
+
+function getClientIp(req) {
+  // trust proxy = true → req.ip já considera x-forwarded-for
+  const ip = req.ip || '';
+  return String(ip).trim();
+}
+
+function normalizeCpf(payer) {
+  const cpfFromLegacy = payer?.cpf;
+  const cpfFromIdentification = payer?.identification?.number;
+  const cpf = String(cpfFromLegacy || cpfFromIdentification || '').replace(/\D/g, '');
+  return cpf.length === 11 ? cpf : '';
+}
+
+function splitName(payer) {
+  const first = String(payer?.firstName || payer?.first_name || '').trim();
+  const last = String(payer?.lastName || payer?.last_name || '').trim();
+  return { first, last };
+}
+
+function normalizePhone(payer) {
+  const raw = payer?.phone;
+  if (raw && typeof raw === 'object') {
+    return {
+      area_code: String(raw.area_code || raw.areaCode || '').replace(/\D/g, '') || undefined,
+      number: String(raw.number || '').replace(/\D/g, '') || undefined,
+    };
+  }
+  const clean = String(raw || '').replace(/\D/g, '');
+  if (clean.length >= 10) {
+    return { area_code: clean.substring(0, 2), number: clean.substring(2) };
+  }
+  return {};
+}
+
+function normalizeAddress(payer) {
+  const a = payer?.address || {};
+  const zip = String(a.zip_code || a.zipCode || '').replace(/\D/g, '');
+  return {
+    zip_code: zip || undefined,
+    street_name: a.street_name || a.streetName || a.street || undefined,
+    street_number: a.street_number || a.streetNumber || a.number || undefined,
+    neighborhood: a.neighborhood || undefined,
+    city: a.city || undefined,
+    federal_unit: a.federal_unit || a.federalUnit || a.state || undefined,
+  };
+}
+
 // Rota para testar configuração do Mercado Pago
 app.get('/config-test', async (req, res) => {
   try {
-    console.log('=== DEBUG: Testando configuração do Mercado Pago ===');
-    console.log('Access Token:', MP_ACCESS_TOKEN ? 'Configurado' : 'Não configurado');
-    console.log('PIX Key:', PIX_KEY);
-    console.log('PIX Key Type:', PIX_KEY_TYPE);
-    
-    const response = await axios.get(
-      'https://api.mercadopago.com/v1/payment_methods',
-      {
-        headers: {
-          Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-        },
-      }
-    );
-    
-    console.log('✅ Configuração do Mercado Pago válida');
-    res.json({ 
-      status: 'ok', 
+    if (!MP_ACCESS_TOKEN) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'MP access token ausente (MERCADOPAGO_ACCESS_TOKEN / MERCADO_PAGO_ACCESS_TOKEN).',
+      });
+    }
+
+    const response = await axios.get('https://api.mercadopago.com/v1/payment_methods', {
+      headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+    });
+
+    res.json({
+      status: 'ok',
       message: 'Mercado Pago configurado corretamente',
       pixKey: PIX_KEY,
-      pixKeyType: PIX_KEY_TYPE
+      pixKeyType: PIX_KEY_TYPE,
+      payment_methods_count: Array.isArray(response.data) ? response.data.length : undefined,
     });
   } catch (error) {
-    console.error('❌ Erro na configuração do Mercado Pago:', error.response?.data || error.message);
-    res.status(400).json({ 
-      status: 'error', 
+    res.status(400).json({
+      status: 'error',
       message: 'Token do Mercado Pago inválido ou sem permissões',
-      error: error.response?.data || error.message
+      error: error.response?.data || error.message,
     });
   }
 });
@@ -175,239 +256,175 @@ app.post('/create-payment', async (req, res) => {
     amount,
     description,
     payer,
-    cardToken, // opcional
-    paymentMethod, // 'pix' ou 'credit_card'
-    cardNumber, // necessário para detectar o tipo de cartão
-    items, // opcional: [{ title, description, category_id|categoryId, quantity, unit_price }]
-    categoryId, // opcional: categoria padrão quando items não vier
-    notificationUrl, // opcional: sobrescreve notification_url por request
-    deviceId, // opcional: Device Session ID do Mercado Pago (MP_DEVICE_SESSION_ID)
-    externalReference, // opcional: ID interno para correlacionar payment_id no MP
+    cardToken,
+    paymentMethod, // 'pix' | 'credit_card'
+    cardNumber, // apenas para detectar tipo (NÃO enviar ao MP)
+    items,
+    categoryId,
+    notificationUrl,
+    deviceId,
+    externalReference,
     statementDescriptor,
-  } = req.body;
+  } = req.body || {};
 
-  console.log('=== DEBUG: Recebendo requisição de pagamento ===');
-  console.log('Dados recebidos:', { amount, description, paymentMethod, cardNumber: cardNumber?.substring(0, 6) + '...' });
-
-  if (!amount || !description || !payer || !payer.email || !payer.cpf) {
-    return res.status(400).json({ error: 'Parâmetros obrigatórios ausentes.' });
+  if (!MP_ACCESS_TOKEN) {
+    return res.status(500).json({ error: 'MP access token ausente no servidor.' });
   }
 
-  const idempotencyKey = uuidv4();
-  const cleanCpf = payer.cpf.replace(/\D/g, '');
+  const cleanAmount = Number(amount);
+  const cleanDesc = String(description || '').trim();
+
+  const cpf = normalizeCpf(payer);
+  const { first, last } = splitName(payer);
+  const phone = normalizePhone(payer);
+  const address = normalizeAddress(payer);
+
+  // Obrigatórios mínimos (aceita payer.cpf OU payer.identification.number)
+  if (!cleanAmount || !cleanDesc || !payer?.email || !cpf) {
+    return res.status(400).json({
+      error: 'Parâmetros obrigatórios ausentes.',
+      required: ['amount', 'description', 'payer.email', 'payer.cpf OR payer.identification.number'],
+    });
+  }
+
+  const idempotencyKey = req.get('x-idempotency-key') || uuidv4();
+  const clientIp = getClientIp(req);
+  const clientUserAgent = req.get('user-agent') || '';
+  const resolvedDeviceId = getMeliSessionId(req, deviceId);
 
   const paymentData = {
-    transaction_amount: parseFloat(amount),
-    description,
+    transaction_amount: cleanAmount,
+    description: cleanDesc,
+    external_reference: String(externalReference || '').trim() || uuidv4(),
+    binary_mode: true,
     payer: {
       email: payer.email,
-      first_name: payer.firstName || '',
-      last_name: payer.lastName || '',
-      identification: {
-        type: 'CPF',
-        number: cleanCpf,
-      },
+      first_name: first || undefined,
+      last_name: last || undefined,
+      identification: { type: 'CPF', number: cpf },
+      ...(phone.area_code || phone.number ? { phone } : {}),
+      ...(address.zip_code || address.street_name ? { address } : {}),
+      // se tiver no seu app: payer.dateRegistered / payer.registrationDate
+      ...(payer?.dateRegistered || payer?.registrationDate
+        ? { date_registered: payer.dateRegistered || payer.registrationDate }
+        : {}),
     },
     metadata: {
       integration: 'flutter_custom_screen',
-      user_id: payer.userId || 'unknown',
+      user_id: payer?.userId || payer?.user_id || 'unknown',
+      client_ip: clientIp || undefined,
+      client_user_agent: clientUserAgent || undefined,
     },
   };
 
-  // external_reference: código único para correlacionar payment_id com ID interno do seu sistema
-  const resolvedExternalReference = (externalReference || '').toString().trim() || uuidv4();
-  paymentData.external_reference = resolvedExternalReference;
-
-  // Enviar itens (com category_id) para melhorar análise de risco / aprovação no Mercado Pago.
-  // Referência: Campo additional_info.items (Payments API).
-  const DEFAULT_ITEM_CATEGORY_ID = (process.env.MP_DEFAULT_ITEM_CATEGORY_ID || '').trim();
-  const fallbackCategoryId = (categoryId || DEFAULT_ITEM_CATEGORY_ID || '').trim();
-  const normalizedAmount = parseFloat(amount);
+  // Itens (additional_info.items) ajudam score
+  const DEFAULT_ITEM_CATEGORY_ID = String(process.env.MP_DEFAULT_ITEM_CATEGORY_ID || '').trim();
+  const fallbackCategoryId = String(categoryId || DEFAULT_ITEM_CATEGORY_ID || '').trim();
 
   const normalizeItems = () => {
-    // Se vier uma lista de items no request, normaliza e usa.
     if (Array.isArray(items) && items.length > 0) {
       const normalized = items
         .map((it) => {
-          const quantity = Number.isFinite(Number(it.quantity)) && Number(it.quantity) > 0 ? Number(it.quantity) : 1;
-          const unitPrice = Number.isFinite(Number(it.unit_price)) && Number(it.unit_price) > 0
-            ? Number(it.unit_price)
-            : (Number.isFinite(normalizedAmount) ? normalizedAmount : 0);
-          const category = (it.category_id || it.categoryId || fallbackCategoryId || '').toString().trim();
-
+          const quantity =
+            Number.isFinite(Number(it.quantity)) && Number(it.quantity) > 0 ? Number(it.quantity) : 1;
+          const unitPrice =
+            Number.isFinite(Number(it.unit_price)) && Number(it.unit_price) > 0
+              ? Number(it.unit_price)
+              : cleanAmount;
+          const category = String(it.category_id || it.categoryId || fallbackCategoryId || '').trim();
           return {
             id: it.id ? String(it.id) : undefined,
-            title: it.title ? String(it.title) : String(description),
-            description: it.description ? String(it.description) : String(description),
+            title: it.title ? String(it.title) : cleanDesc,
+            description: it.description ? String(it.description) : cleanDesc,
             category_id: category || undefined,
             quantity,
             unit_price: unitPrice,
           };
         })
         .filter((it) => Number(it.unit_price) > 0 && Number(it.quantity) > 0);
-
       if (normalized.length > 0) return normalized;
     }
-
-    // Caso contrário, cria um item padrão usando description/amount.
     return [
       {
-        title: String(description),
-        description: String(description),
+        title: cleanDesc,
+        description: cleanDesc,
         category_id: fallbackCategoryId || undefined,
         quantity: 1,
-        unit_price: Number.isFinite(normalizedAmount) ? normalizedAmount : 0,
+        unit_price: cleanAmount,
       },
-    ].filter((it) => Number(it.unit_price) > 0);
+    ];
   };
 
   const additionalItems = normalizeItems();
-  if (additionalItems.length > 0) {
-    paymentData.additional_info = {
-      items: additionalItems,
-    };
-    console.log('Itens enviados para análise de risco (additional_info.items):', JSON.stringify(additionalItems, null, 2));
-  }
+  paymentData.additional_info = {
+    items: additionalItems,
+    payer: {
+      ...(address.zip_code || address.street_name ? { address } : {}),
+      ...(payer?.dateRegistered || payer?.registrationDate
+        ? { registration_date: payer.dateRegistered || payer.registrationDate }
+        : {}),
+    },
+  };
 
-  // Webhook do Mercado Pago (Payments API)
-  const resolvedNotificationUrl = (notificationUrl || MP_NOTIFICATION_URL || '').toString().trim();
+  // Webhook
+  const resolvedNotificationUrl = String(notificationUrl || MP_NOTIFICATION_URL || '').trim();
   if (resolvedNotificationUrl) {
     paymentData.notification_url = resolvedNotificationUrl;
-    console.log(`notification_url aplicado: ${resolvedNotificationUrl}`);
   }
 
-  const normalizedDescriptor = (statementDescriptor || DEFAULT_STATEMENT_DESCRIPTOR || '').trim().slice(0, 16);
+  // statement_descriptor
+  const normalizedDescriptor = String(statementDescriptor || DEFAULT_STATEMENT_DESCRIPTOR || '')
+    .trim()
+    .slice(0, 16);
   if (normalizedDescriptor) {
     paymentData.statement_descriptor = normalizedDescriptor;
-    console.log(`Statement descriptor aplicado: ${normalizedDescriptor}`);
   }
 
   if (paymentMethod === 'credit_card') {
     if (!cardToken) {
       return res.status(400).json({ error: 'Token do cartão é obrigatório para pagamento com cartão.' });
     }
-    
-    if (!cardNumber) {
-      return res.status(400).json({ error: 'Número do cartão é obrigatório para detectar o tipo de cartão.' });
-    }
-    
-    // Detectar o tipo de cartão baseado no número
-    let cardType = 'master'; // fallback
-    if (cardNumber) {
-      cardType = detectCardType(cardNumber);
-    }
-    
+
+    const cardType = detectCardType(cardNumber);
     paymentData.payment_method_id = cardType;
     paymentData.token = cardToken;
     paymentData.installments = 1;
-    
-    // Adicionar dados específicos para cartão
-    paymentData.capture = true; // Capturar o pagamento imediatamente
-    paymentData.binary_mode = true; // Modo binário para evitar pagamentos pendentes
-    
-    console.log(`Detectado tipo de cartão: ${cardType} para BIN: ${cardNumber?.substring(0, 6)}`);
-    console.log(`Token do cartão recebido: ${cardToken}`);
+    paymentData.capture = true;
+    paymentData.three_d_secure_mode = 'optional';
   } else {
-    // Para PIX - apenas definir o método de pagamento
-    // O Mercado Pago gera automaticamente o QR code
     paymentData.payment_method_id = 'pix';
-    
-    console.log('=== DEBUG: Configurando PIX com chave cadastrada ===');
-    console.log('PIX Key:', PIX_KEY);
-    console.log('PIX Key Type:', PIX_KEY_TYPE);
   }
 
   try {
-    const resolvedDeviceId = (deviceId || req.headers['x-meli-session-id'] || req.headers['x-meli-sessionid'] || '')
-      .toString()
-      .trim();
+    const mpHeaders = {
+      Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json',
+      'X-Idempotency-Key': idempotencyKey,
+      // Repasse de antifraude
+      ...(resolvedDeviceId ? { 'X-meli-session-id': resolvedDeviceId } : {}),
+      ...(clientUserAgent ? { 'User-Agent': clientUserAgent } : {}),
+    };
 
-    console.log('=== DEBUG: Enviando dados para Mercado Pago ===');
-    console.log('Token do cartão:', cardToken);
-    console.log('Número do cartão:', cardNumber);
-    console.log('Tipo de cartão detectado:', paymentMethod === 'credit_card' ? detectCardType(cardNumber) : 'pix');
-    console.log('Dados enviados para Mercado Pago:', JSON.stringify(paymentData, null, 2));
-    
-    const response = await axios.post(
-      'https://api.mercadopago.com/v1/payments',
-      paymentData,
-      {
-        headers: {
-          Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-          'X-Idempotency-Key': idempotencyKey,
-          ...(resolvedDeviceId ? { 'X-meli-session-id': resolvedDeviceId } : {}),
-        },
-      }
-    );
-    
-    console.log('=== DEBUG: Resposta do Mercado Pago ===');
-    console.log('Status:', response.data.status);
-    console.log('Status Detail:', response.data.status_detail);
-    console.log('Payment ID:', response.data.id);
-    
-    // Para PIX, verificar se o QR code foi gerado
-    if (paymentMethod === 'pix' && response.data.point_of_interaction) {
-      const qrCode = response.data.point_of_interaction.transaction_data?.qr_code;
-      const qrCodeBase64 = response.data.point_of_interaction.transaction_data?.qr_code_base64;
-      
-      console.log('QR Code gerado:', qrCode ? 'Sim' : 'Não');
-      console.log('QR Code Base64:', qrCodeBase64 ? 'Sim' : 'Não');
-      
-      if (!qrCode) {
-        console.log('⚠️ QR Code não foi gerado - verificar configuração da chave PIX');
-      }
-    }
-    
-    console.log('Resposta completa:', JSON.stringify(response.data, null, 2));
-    
-    // Verificar se o pagamento foi aprovado
-    if (response.data.status === 'approved') {
-      console.log('✅ Pagamento aprovado com sucesso!');
-    } else if (response.data.status === 'in_process') {
-      console.log('⏳ Pagamento em processamento - pode precisar de revisão manual');
-    } else if (response.data.status === 'rejected') {
-      console.log('❌ Pagamento rejeitado');
-    }
-    
-    // Inclui o external_reference usado para facilitar correlação no cliente
-    res.status(200).json({ ...response.data, external_reference: resolvedExternalReference });
+    const response = await axios.post('https://api.mercadopago.com/v1/payments', paymentData, {
+      headers: mpHeaders,
+      timeout: 30000,
+    });
+
+    res.status(200).json({
+      ...response.data,
+      external_reference: paymentData.external_reference,
+    });
   } catch (error) {
-    console.error('Erro ao criar pagamento:', error.response?.data || error.message);
-    
-    // Tratamento específico para erro de BIN
-    if (error.response?.data?.cause?.[0]?.code === 10103) {
-      return res.status(400).json({
-        error: 'Erro de BIN do cartão',
-        message: 'O tipo de cartão não corresponde ao BIN informado. Verifique os dados do cartão.',
-        details: error.response.data
-      });
-    }
-    
-    // Tratamento específico para erro de configuração PIX
-    if (error.response?.data?.error?.message?.includes('Collector user without key enabled for QR render')) {
-      return res.status(400).json({
-        error: 'Erro de configuração PIX',
-        message: 'Conta do Mercado Pago não tem permissões para gerar QR Code. Verifique as configurações da conta.',
-        details: error.response.data
-      });
-    }
-    
     res.status(500).json({ error: error.response?.data || error.message });
   }
 });
 
-// Endpoint para receber notificações (Webhook) do Mercado Pago.
-// Configure MP_NOTIFICATION_URL (ou NOTIFICATION_URL) apontando para esta rota pública.
+// Webhook Mercado Pago
 app.post('/webhooks/mercadopago', (req, res) => {
   try {
-    // Mercado Pago pode enviar diferentes formatos dependendo do produto/config.
-    // Registramos o payload completo para debug/auditoria.
     console.log('=== WEBHOOK Mercado Pago recebido ===');
     console.log('Headers:', JSON.stringify(req.headers, null, 2));
     console.log('Body:', JSON.stringify(req.body, null, 2));
-
-    // Responder 200 rápido para evitar retries.
     res.sendStatus(200);
   } catch (error) {
     console.error('Erro ao processar webhook Mercado Pago:', error.message);
@@ -415,180 +432,77 @@ app.post('/webhooks/mercadopago', (req, res) => {
   }
 });
 
-// Rota para testar token do cartão
+// Gera token de cartão no MP (usando PUBLIC_KEY + session-id)
 app.post('/test-card-token', async (req, res) => {
-  const { cardNumber, expirationMonth, expirationYear, cvv, cardholderName, cpf } = req.body;
-  
+  const { cardNumber, expirationMonth, expirationYear, cvv, cardholderName, cpf, deviceId } =
+    req.body || {};
+
   try {
-    const cleanCpf = cpf.replace(/\D/g, '');
-    const cleanCard = cardNumber.replace(/\D/g, '');
-    
+    if (!MP_PUBLIC_KEY) {
+      return res.status(500).json({ error: 'MP public key ausente no servidor.' });
+    }
+    const cleanCpf = String(cpf || '').replace(/\D/g, '');
+    const cleanCard = String(cardNumber || '').replace(/\D/g, '');
+    const expMonth = parseInt(expirationMonth, 10);
+    const expYear =
+      String(expirationYear || '').length === 2
+        ? parseInt(`20${expirationYear}`, 10)
+        : parseInt(expirationYear, 10);
+
     const tokenData = {
       card_number: cleanCard,
-      expiration_month: parseInt(expirationMonth),
-      expiration_year: expirationYear.length === 2 ? parseInt(`20${expirationYear}`) : parseInt(expirationYear),
-      security_code: cvv,
+      expiration_month: expMonth,
+      expiration_year: expYear,
+      security_code: String(cvv || ''),
       cardholder: {
-        name: cardholderName,
-        identification: {
-          type: 'CPF',
-          number: cleanCpf,
-        },
+        name: String(cardholderName || ''),
+        identification: { type: 'CPF', number: cleanCpf },
       },
     };
-    
-    console.log('=== DEBUG: Testando token do cartão ===');
-    console.log('Dados do cartão:', JSON.stringify(tokenData, null, 2));
-    
+
+    const resolvedDeviceId = getMeliSessionId(req, deviceId);
+
     const response = await axios.post(
-      'https://api.mercadopago.com/v1/card_tokens',
+      `https://api.mercadopago.com/v1/card_tokens?public_key=${encodeURIComponent(MP_PUBLIC_KEY)}`,
       tokenData,
       {
         headers: {
           'Content-Type': 'application/json',
+          ...(resolvedDeviceId ? { 'X-meli-session-id': resolvedDeviceId } : {}),
+          ...(req.get('user-agent') ? { 'User-Agent': req.get('user-agent') } : {}),
         },
+        timeout: 30000,
       }
     );
-    
-    console.log('Token gerado:', response.data);
+
     res.status(200).json(response.data);
   } catch (error) {
-    console.error('Erro ao gerar token:', error.response?.data || error.message);
     res.status(500).json({ error: error.response?.data || error.message });
   }
 });
 
-// Rota para consultar status do pagamento
+// Consulta pagamento no MP
 app.get('/payment-status/:id', async (req, res) => {
   const { id } = req.params;
-
   try {
-    const response = await axios.get(
-      `https://api.mercadopago.com/v1/payments/${id}`,
-      {
-        headers: {
-          Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-        },
-      }
-    );
-    
-    console.log('=== DEBUG: Status do pagamento ===');
-    console.log('Payment ID:', id);
-    console.log('Status:', response.data.status);
-    console.log('Status Detail:', response.data.status_detail);
-    
+    const response = await axios.get(`https://api.mercadopago.com/v1/payments/${id}`, {
+      headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+      timeout: 30000,
+    });
     res.status(200).json(response.data);
   } catch (error) {
-    console.error('Erro ao consultar pagamento:', error.response?.data || error.message);
     res.status(500).json({ error: error.response?.data || error.message });
   }
 });
 
-// Rota para obter informações da chave PIX
+// Info PIX
 app.get('/pix-info', (req, res) => {
-  res.json({
-    pixKey: PIX_KEY,
-    pixKeyType: PIX_KEY_TYPE,
-    status: 'configured'
-  });
-});
-
-// Checkout Pro: criar preferência (Preferences API)
-// Envie notification_url no request de "Preferências" para habilitar Webhooks.
-app.post('/create-preference', async (req, res) => {
-  const {
-    items,
-    payer,
-    notificationUrl, // opcional: sobrescreve notification_url por request
-    externalReference,
-    backUrls,
-    autoReturn,
-    statementDescriptor,
-    deviceId, // opcional: Device Session ID do Mercado Pago (MP_DEVICE_SESSION_ID)
-  } = req.body || {};
-
-  if (!Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: 'items é obrigatório para criar preferência.' });
-  }
-
-  const normalizedItems = items.map((it) => ({
-    id: it.id ? String(it.id) : undefined,
-    title: it.title ? String(it.title) : undefined,
-    description: it.description ? String(it.description) : undefined,
-    category_id: (it.category_id || it.categoryId || '').toString().trim() || undefined,
-    quantity: Number.isFinite(Number(it.quantity)) && Number(it.quantity) > 0 ? Number(it.quantity) : 1,
-    unit_price: Number.isFinite(Number(it.unit_price)) ? Number(it.unit_price) : undefined,
-    currency_id: it.currency_id ? String(it.currency_id) : undefined,
-  }));
-
-  const resolvedNotificationUrl = (notificationUrl || MP_NOTIFICATION_URL || '').toString().trim();
-  const normalizedDescriptor = (statementDescriptor || DEFAULT_STATEMENT_DESCRIPTOR || '').trim().slice(0, 16);
-  const resolvedExternalReference = (externalReference || '').toString().trim() || uuidv4();
-  const resolvedDeviceId = (deviceId || req.headers['x-meli-session-id'] || req.headers['x-meli-sessionid'] || '')
-    .toString()
-    .trim();
-
-  const preferenceData = {
-    items: normalizedItems,
-  };
-
-  if (payer?.email) {
-    preferenceData.payer = {
-      email: payer.email,
-      name: payer.firstName || payer.name || '',
-      surname: payer.lastName || payer.surname || '',
-    };
-  }
-
-  if (resolvedNotificationUrl) {
-    preferenceData.notification_url = resolvedNotificationUrl;
-  }
-
-  // external_reference: código único para correlacionar payment_id com ID interno do seu sistema
-  preferenceData.external_reference = resolvedExternalReference;
-
-  if (backUrls && typeof backUrls === 'object') {
-    preferenceData.back_urls = backUrls;
-  }
-
-  if (autoReturn) {
-    preferenceData.auto_return = String(autoReturn);
-  }
-
-  if (normalizedDescriptor) {
-    // Campo usado no Checkout Pro para fatura/cartão, quando aplicável
-    preferenceData.statement_descriptor = normalizedDescriptor;
-  }
-
-  try {
-    const response = await axios.post(
-      'https://api.mercadopago.com/checkout/preferences',
-      preferenceData,
-      {
-        headers: {
-          Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-          ...(resolvedDeviceId ? { 'X-meli-session-id': resolvedDeviceId } : {}),
-        },
-      }
-    );
-
-    // Inclui o external_reference usado (em geral o MP também devolve esse campo)
-    res.status(200).json({ ...response.data, external_reference: resolvedExternalReference });
-  } catch (error) {
-    console.error('Erro ao criar preferência:', error.response?.data || error.message);
-    res.status(500).json({ error: error.response?.data || error.message });
-  }
+  res.json({ pixKey: PIX_KEY, pixKeyType: PIX_KEY_TYPE, status: 'configured' });
 });
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
-
 app.listen(PORT, HOST, () => {
-  console.log('=== DEBUG: Configuração do Backend ===');
-  console.log('Access Token:', MP_ACCESS_TOKEN ? 'Configurado' : 'Não configurado');
-  console.log('PIX Key:', PIX_KEY);
-  console.log('PIX Key Type:', PIX_KEY_TYPE);
-  console.log(`Backend de pagamento rodando na porta HTTP ${PORT}`);
+  console.log('Backend de pagamento rodando na porta HTTP', PORT);
 });
 
 if (SSL_ENABLED) {
@@ -600,20 +514,16 @@ if (SSL_ENABLED) {
       minVersion: 'TLSv1.2',
       secureOptions: cryptoConstants.SSL_OP_NO_TLSv1 | cryptoConstants.SSL_OP_NO_TLSv1_1,
     };
-
-    if (process.env.SSL_PASSPHRASE) {
-      httpsOptions.passphrase = process.env.SSL_PASSPHRASE;
-    }
+    if (process.env.SSL_PASSPHRASE) httpsOptions.passphrase = process.env.SSL_PASSPHRASE;
 
     https.createServer(httpsOptions, app).listen(HTTPS_PORT, HOST, () => {
-      console.log('=== DEBUG: HTTPS habilitado ===');
-      console.log(`Certificado SSL carregado de: ${source === 'generated' ? 'auto-gerado' : 'arquivo existente'}`);
-      console.log('Versão mínima TLS aplicadas: TLSv1.2');
-      console.log(`Backend de pagamento rodando na porta HTTPS ${HTTPS_PORT}`);
+      console.log('=== HTTPS habilitado ===');
+      console.log('Certificado SSL carregado de:', source);
+      console.log('Backend rodando na porta HTTPS', HTTPS_PORT);
     });
   } catch (error) {
     console.warn(`⚠️ HTTPS não iniciado: ${error.message}`);
   }
-} else {
-  console.log('HTTPS desabilitado. Defina SSL_ENABLED=true para ativar.');
 }
+
+
