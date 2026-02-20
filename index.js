@@ -606,7 +606,7 @@ if (SSL_ENABLED) {
       console.log('Backend rodando na porta HTTPS', HTTPS_PORT);
     });
   } catch (error) {
-    console.warn(`⚠️ HTTPS não iniciado: ${error.message}`);
+    console.warn(` HTTPS não iniciado: ${error.message}`);
   }
 }
 
