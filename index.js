@@ -202,11 +202,22 @@ app.get('/debug/ip', (req, res) => {
   });
 });
 
+function normalizeIdentification(payer) {
+  const raw =
+    payer?.cpf ||
+    payer?.cnpj ||
+    payer?.identification?.number ||
+    '';
+  const digits = String(raw).replace(/\D/g, '');
+  if (digits.length === 11) return { type: 'CPF', number: digits };
+  if (digits.length === 14) return { type: 'CNPJ', number: digits };
+  return null;
+}
+
+// Mantém compatibilidade com código legado que chama normalizeCpf
 function normalizeCpf(payer) {
-  const cpfFromLegacy = payer?.cpf;
-  const cpfFromIdentification = payer?.identification?.number;
-  const cpf = String(cpfFromLegacy || cpfFromIdentification || '').replace(/\D/g, '');
-  return cpf.length === 11 ? cpf : '';
+  const id = normalizeIdentification(payer);
+  return id ? id.number : '';
 }
 
 function splitName(payer) {
@@ -329,16 +340,16 @@ app.post('/create-payment', async (req, res) => {
   const cleanAmount = Number(amount);
   const cleanDesc = String(description || '').trim();
 
-  const cpf = normalizeCpf(payer);
+  const identification = normalizeIdentification(payer);
   const { first, last } = splitName(payer);
   const phone = normalizePhone(payer);
   const address = normalizeAddress(payer);
 
-  // Obrigatórios mínimos (aceita payer.cpf OU payer.identification.number)
-  if (!cleanAmount || !cleanDesc || !payer?.email || !cpf) {
+  // Obrigatórios mínimos (aceita CPF 11 dígitos ou CNPJ 14 dígitos)
+  if (!cleanAmount || !cleanDesc || !payer?.email || !identification) {
     return res.status(400).json({
       error: 'Parâmetros obrigatórios ausentes.',
-      required: ['amount', 'description', 'payer.email', 'payer.cpf OR payer.identification.number'],
+      required: ['amount', 'description', 'payer.email', 'payer.cpf (11 dígitos) ou payer.cnpj (14 dígitos)'],
     });
   }
 
@@ -357,7 +368,7 @@ app.post('/create-payment', async (req, res) => {
       email: payer.email,
       first_name: first || undefined,
       last_name: last || undefined,
-      identification: { type: 'CPF', number: cpf },
+      identification,
       ...(phone.area_code || phone.number ? { phone } : {}),
       ...(address.zip_code || address.street_name ? { address } : {}),
       // se tiver no seu app: payer.dateRegistered / payer.registrationDate
@@ -568,14 +579,15 @@ app.post('/webhooks/mercadopago', async (req, res) => {
 
 // Gera token de cartão no MP (usando PUBLIC_KEY + session-id)
 app.post('/test-card-token', async (req, res) => {
-  const { cardNumber, expirationMonth, expirationYear, cvv, cardholderName, cpf, deviceId } =
+  const { cardNumber, expirationMonth, expirationYear, cvv, cardholderName, cpf, cnpj, deviceId } =
     req.body || {};
 
   try {
     if (!MP_PUBLIC_KEY) {
       return res.status(500).json({ error: 'MP public key ausente no servidor.' });
     }
-    const cleanCpf = String(cpf || '').replace(/\D/g, '');
+    const rawDoc = String(cpf || cnpj || '').replace(/\D/g, '');
+    const docType = rawDoc.length === 14 ? 'CNPJ' : 'CPF';
     const cleanCard = String(cardNumber || '').replace(/\D/g, '');
     const expMonth = parseInt(expirationMonth, 10);
     const expYear =
@@ -590,7 +602,7 @@ app.post('/test-card-token', async (req, res) => {
       security_code: String(cvv || ''),
       cardholder: {
         name: String(cardholderName || ''),
-        identification: { type: 'CPF', number: cleanCpf },
+        identification: { type: docType, number: rawDoc },
       },
     };
 
