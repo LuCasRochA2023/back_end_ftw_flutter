@@ -256,6 +256,20 @@ function toAdditionalInfoAddress(address) {
   return minimal;
 }
 
+// Armazenamento em memória: paymentId → { status, status_detail, updatedAt, raw }
+const paymentCache = new Map();
+// SSE clients: paymentId → Set de res (response streams)
+const sseClients = new Map();
+
+function broadcastPaymentUpdate(paymentId, data) {
+  const clients = sseClients.get(String(paymentId));
+  if (!clients || clients.size === 0) return;
+  const payload = `data: ${JSON.stringify(data)}\n\n`;
+  for (const res of clients) {
+    try { res.write(payload); } catch (_) {}
+  }
+}
+
 // Rota para testar configuração do Mercado Pago
 app.get('/config-test', async (req, res) => {
   try {
@@ -504,15 +518,51 @@ app.post('/create-payment', async (req, res) => {
 });
 
 // Webhook Mercado Pago
-app.post('/webhooks/mercadopago', (req, res) => {
+app.post('/webhooks/mercadopago', async (req, res) => {
+  // Responde 200 imediatamente (MP exige resposta rápida para não reenviar).
+  res.sendStatus(200);
+
   try {
-    console.log('=== WEBHOOK Mercado Pago recebido ===');
-    console.log('Headers:', JSON.stringify(req.headers, null, 2));
-    console.log('Body:', JSON.stringify(req.body, null, 2));
-    res.sendStatus(200);
+    const body = req.body || {};
+    console.log('=== WEBHOOK Mercado Pago recebido ===', JSON.stringify(body));
+
+    // O MP envia { type: 'payment', data: { id: '...' } }
+    const paymentId = body?.data?.id || body?.id;
+    if (!paymentId) return;
+
+    // Consulta o status real do pagamento na API do MP.
+    const mpResponse = await axios.get(
+      `https://api.mercadopago.com/v1/payments/${paymentId}`,
+      {
+        headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+        timeout: 15000,
+      }
+    );
+
+    const payment = mpResponse.data;
+    const update = {
+      id: payment.id,
+      status: payment.status,
+      status_detail: payment.status_detail,
+      external_reference: payment.external_reference,
+      transaction_amount: payment.transaction_amount,
+      payment_method_id: payment.payment_method_id,
+      updatedAt: new Date().toISOString(),
+    };
+
+    console.log(`Pagamento ${paymentId}: ${payment.status} (${payment.status_detail})`);
+
+    // Salva no cache e notifica clientes SSE conectados.
+    paymentCache.set(String(paymentId), update);
+    if (payment.external_reference) {
+      paymentCache.set(String(payment.external_reference), update);
+    }
+    broadcastPaymentUpdate(String(paymentId), update);
+    if (payment.external_reference) {
+      broadcastPaymentUpdate(String(payment.external_reference), update);
+    }
   } catch (error) {
-    console.error('Erro ao processar webhook Mercado Pago:', error.message);
-    res.sendStatus(500);
+    console.error('Erro ao processar webhook Mercado Pago:', error.response?.data || error.message);
   }
 });
 
@@ -565,15 +615,34 @@ app.post('/test-card-token', async (req, res) => {
   }
 });
 
-// Consulta pagamento no MP
+// Consulta pagamento — tenta cache primeiro, depois consulta o MP.
 app.get('/payment-status/:id', async (req, res) => {
   const { id } = req.params;
   try {
+    const cached = paymentCache.get(String(id));
+    if (cached) {
+      return res.status(200).json({ ...cached, source: 'cache' });
+    }
+
     const response = await axios.get(`https://api.mercadopago.com/v1/payments/${id}`, {
       headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
       timeout: 30000,
     });
-    res.status(200).json(response.data);
+
+    // Atualiza o cache com o resultado fresco.
+    const payment = response.data;
+    const update = {
+      id: payment.id,
+      status: payment.status,
+      status_detail: payment.status_detail,
+      external_reference: payment.external_reference,
+      transaction_amount: payment.transaction_amount,
+      payment_method_id: payment.payment_method_id,
+      updatedAt: new Date().toISOString(),
+    };
+    paymentCache.set(String(id), update);
+
+    res.status(200).json({ ...payment, source: 'mp_api' });
   } catch (error) {
     res.status(500).json({ error: error.response?.data || error.message });
   }
@@ -582,6 +651,42 @@ app.get('/payment-status/:id', async (req, res) => {
 // Info PIX
 app.get('/pix-info', (req, res) => {
   res.json({ pixKey: PIX_KEY, pixKeyType: PIX_KEY_TYPE, status: 'configured' });
+});
+
+// SSE: o app Flutter se inscreve aqui e recebe evento quando o pagamento for confirmado.
+// GET /payment-updates/:id
+// O cliente mantém a conexão aberta; quando o MP notificar via webhook, o evento chega aqui.
+app.get('/payment-updates/:id', (req, res) => {
+  const paymentId = String(req.params.id);
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.flushHeaders();
+
+  // Se o status já está no cache (chegou antes do app se inscrever), envia imediatamente.
+  const cached = paymentCache.get(paymentId);
+  if (cached) {
+    res.write(`data: ${JSON.stringify(cached)}\n\n`);
+  } else {
+    // Heartbeat inicial para o Flutter saber que a conexão está viva.
+    res.write(`: connected\n\n`);
+  }
+
+  if (!sseClients.has(paymentId)) sseClients.set(paymentId, new Set());
+  sseClients.get(paymentId).add(res);
+
+  const cleanup = () => {
+    const clients = sseClients.get(paymentId);
+    if (clients) {
+      clients.delete(res);
+      if (clients.size === 0) sseClients.delete(paymentId);
+    }
+  };
+
+  req.on('close', cleanup);
+  req.on('error', cleanup);
 });
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
