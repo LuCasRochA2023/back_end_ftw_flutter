@@ -528,8 +528,7 @@ app.post('/create-payment', async (req, res) => {
   }
 });
 
-// Webhook Mercado Pago
-app.post('/webhooks/mercadopago', async (req, res) => {
+async function handleMercadoPagoWebhook(req, res) {
   // Responde 200 imediatamente (MP exige resposta rápida para não reenviar).
   res.sendStatus(200);
 
@@ -575,7 +574,13 @@ app.post('/webhooks/mercadopago', async (req, res) => {
   } catch (error) {
     console.error('Erro ao processar webhook Mercado Pago:', error.response?.data || error.message);
   }
-});
+}
+
+// Webhook Mercado Pago — aceita as duas URLs para garantir compatibilidade
+// /webhooks/mercadopago  → URL configurada no .env (MP_NOTIFICATION_URL)
+// /mp-notification       → URL alternativa que alguns apps enviam no notificationUrl
+app.post('/webhooks/mercadopago', handleMercadoPagoWebhook);
+app.post('/mp-notification', handleMercadoPagoWebhook);
 
 // Gera token de cartão no MP (usando PUBLIC_KEY + session-id)
 app.post('/test-card-token', async (req, res) => {
@@ -627,13 +632,22 @@ app.post('/test-card-token', async (req, res) => {
   }
 });
 
-// Consulta pagamento — tenta cache primeiro, depois consulta o MP.
+const FINAL_STATUSES = new Set(['approved', 'rejected', 'cancelled', 'refunded', 'charged_back']);
+
+// Consulta pagamento.
+// Só usa cache para status finais — status intermediários (pending, in_process)
+// sempre consultam o MP diretamente para não travar o polling do Flutter.
 app.get('/payment-status/:id', async (req, res) => {
   const { id } = req.params;
   try {
     const cached = paymentCache.get(String(id));
-    if (cached) {
-      return res.status(200).json({ ...cached, source: 'cache' });
+    if (cached && FINAL_STATUSES.has(cached.status)) {
+      return res.status(200).json({
+        id: cached.id,
+        status: cached.status,
+        status_detail: cached.status_detail,
+        external_reference: cached.external_reference,
+      });
     }
 
     const response = await axios.get(`https://api.mercadopago.com/v1/payments/${id}`, {
@@ -641,20 +655,20 @@ app.get('/payment-status/:id', async (req, res) => {
       timeout: 30000,
     });
 
-    // Atualiza o cache com o resultado fresco.
     const payment = response.data;
-    const update = {
+    const result = {
       id: payment.id,
       status: payment.status,
       status_detail: payment.status_detail,
       external_reference: payment.external_reference,
-      transaction_amount: payment.transaction_amount,
-      payment_method_id: payment.payment_method_id,
-      updatedAt: new Date().toISOString(),
     };
-    paymentCache.set(String(id), update);
 
-    res.status(200).json({ ...payment, source: 'mp_api' });
+    // Só guarda no cache se for status final.
+    if (FINAL_STATUSES.has(payment.status)) {
+      paymentCache.set(String(id), result);
+    }
+
+    res.status(200).json(result);
   } catch (error) {
     res.status(500).json({ error: error.response?.data || error.message });
   }
